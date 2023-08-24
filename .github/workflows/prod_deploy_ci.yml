@@ -1,0 +1,76 @@
+name: PRODUCTION CI/CD
+
+on:
+  push:
+    branches: [master]
+
+env:
+  IMAGE_NAME: dp-apis
+  PHASE: production
+
+jobs:
+
+  build:
+    name: Build, Push, Remove Image
+    runs-on: self-hosted
+
+    steps:
+    - name: Checkout source code
+      uses: actions/checkout@v3
+
+    - name: Azure ACR login
+      uses: azure/docker-login@v1
+      with:
+        login-server: <AZURE_ACR>
+        username: ${{ secrets.ACR_ACCESS_ID }}
+        password: ${{ secrets.ACR_ACCESS_PWD }}
+
+    - name: Pull Image
+      run: |
+        docker pull <AZURE_ACR>/$IMAGE_NAME:latest || true
+
+    - name: Build Image with cache
+      run: |
+        docker build --cache-from <AZURE_ACR>/$IMAGE_NAME:latest --platform linux/amd64 --file Dockerfile --build-arg SENTRY_DSN=${{ secrets.SENTRY_DSN }} --tag <AZURE_ACR>/$IMAGE_NAME:latest --tag <AZURE_ACR>/$IMAGE_NAME:${{ github.sha }} .
+
+    - name: Push Image
+      run: |
+        docker push <AZURE_ACR>/$IMAGE_NAME:latest
+        docker push <AZURE_ACR>/$IMAGE_NAME:${{ github.sha }}
+
+    - name: Remove Image
+      run: |
+        docker rmi <AZURE_ACR>/$IMAGE_NAME:latest <AZURE_ACR>/$IMAGE_NAME:${{ github.sha }}
+
+
+  deploy:
+    name: Deploy to Infra
+    runs-on: self-hosted
+    needs: build
+
+    steps:
+    - name: Checkout to Infra Repository
+      uses: actions/checkout@v3
+      with:
+        repository: bluewhalekr/dp-server
+        ref: master
+        token: ${{ secrets.INFRA_ACCESS_TOKEN }}
+
+    - name: Setup Kustomize
+      uses: imranismail/setup-kustomize@v1
+
+    - name: Update Kubernetes resources
+      run: |
+        cd app/overlays/$PHASE/
+        kustomize edit set image DP-APIS-IMAGE=<AZURE_ACR>/$IMAGE_NAME:${{ github.sha }}
+        kustomize build .
+
+    - name: Commit files
+      env:
+        API_TOKEN_GITHUB: ${{ secrets.INFRA_ACCESS_TOKEN }}
+      run: |
+        git add app/overlays/$PHASE
+        git config --global user.email "developers@email.com"
+        git config --global user.name "github action"
+        git commit -m "update image tag $GITHUB_SHA"
+        git push
